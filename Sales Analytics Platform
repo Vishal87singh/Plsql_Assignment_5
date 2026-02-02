@@ -1,0 +1,234 @@
+CREATE DATABASE IF NOT EXISTS sales_analytics;
+USE DATABASE sales_analytics;
+SHOW DATABASES LIKE 'SALES_ANALYTICS';
+CREATE SCHEMA IF NOT EXISTS raw;
+CREATE SCHEMA IF NOT EXISTS staging;
+CREATE SCHEMA IF NOT EXISTS production;
+SHOW SCHEMAS;
+CREATE OR REPLACE FILE FORMAT json_format
+TYPE = 'JSON';
+
+CREATE OR REPLACE STAGE data_stage
+FILE_FORMAT = json_format;
+
+SHOW STAGES;
+
+CREATE OR REPLACE TABLE raw.customers (
+    raw_data VARIANT
+);
+
+CREATE OR REPLACE TABLE raw.transactions (
+    raw_data VARIANT
+);
+
+CREATE OR REPLACE TABLE raw.products (
+    raw_data VARIANT
+);
+
+----COPY JSON INTO RAW TABLES----
+COPY INTO raw.customers
+FROM @data_stage/customers.json
+FILE_FORMAT = (TYPE = JSON);
+
+COPY INTO raw.products
+FROM @data_stage/products.json
+FILE_FORMAT = (TYPE = JSON);
+
+COPY INTO raw.transactions
+FROM @data_stage/transactions.json
+FILE_FORMAT = (TYPE = JSON);
+
+SELECT * FROM raw.customers;
+
+— Transform RAW → STAGING
+CREATE OR REPLACE TABLE staging.customers AS
+SELECT
+    raw_data:customer_id::INT AS customer_id,
+    raw_data:name::STRING AS name,
+    raw_data:email::STRING AS email,
+    raw_data:country::STRING AS country,
+    raw_data:created_at::TIMESTAMP AS created_at,
+    CURRENT_TIMESTAMP() AS loaded_at
+FROM raw.customers;
+
+CREATE OR REPLACE TABLE staging.products AS
+SELECT
+    raw_data:product_id::INT AS product_id,
+    raw_data:product_name::STRING AS product_name,
+    raw_data:category::STRING AS category,
+    raw_data:unit_price::DECIMAL(10,2) AS unit_price,
+    raw_data:supplier_id::INT AS supplier_id,
+    CURRENT_TIMESTAMP() AS loaded_at
+FROM raw.products;
+
+CREATE OR REPLACE TABLE staging.transactions AS
+SELECT
+    raw_data:transaction_id::INT AS transaction_id,
+    raw_data:customer_id::INT AS customer_id,
+    raw_data:product_id::INT AS product_id,
+    raw_data:quantity::INT AS quantity,
+    raw_data:unit_price::DECIMAL(10,2) AS unit_price,
+    raw_data:quantity::INT * raw_data:unit_price::DECIMAL(10,2) AS transaction_total,
+    raw_data:transaction_date::DATE AS transaction_date,
+    CURRENT_TIMESTAMP() AS loaded_at
+FROM raw.transactions;
+
+SELECT * FROM staging.transactions;
+
+--- Data Quality Procedure (Snowflake SQL)
+CREATE OR REPLACE PROCEDURE staging.validate_data()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    v_customer_count INT;
+    v_transaction_count INT;
+    v_null_count INT;
+BEGIN
+    SELECT COUNT(*) INTO :v_customer_count FROM staging.customers;
+    SELECT COUNT(*) INTO :v_transaction_count FROM staging.transactions;
+    SELECT COUNT(*) INTO :v_null_count 
+    FROM staging.transactions WHERE customer_id IS NULL;
+
+    RETURN 'Customers=' || v_customer_count ||
+           ', Transactions=' || v_transaction_count ||
+           ', Null Customers=' || v_null_count;
+END;
+$$;
+
+
+CALL staging.validate_data();
+
+--- PRODUCTION FACT TABLE
+CREATE OR REPLACE TABLE production.fact_sales AS
+SELECT
+    t.transaction_date AS sales_date,
+    c.customer_id,
+    p.product_id,
+    p.category,
+    c.country,
+    SUM(t.quantity) AS quantity_sold,
+    SUM(t.transaction_total) AS total_sales,
+    COUNT(DISTINCT t.transaction_id) AS transaction_count
+FROM staging.transactions t
+JOIN staging.customers c ON t.customer_id = c.customer_id
+JOIN staging.products p ON t.product_id = p.product_id
+GROUP BY
+    t.transaction_date,
+    c.customer_id,
+    p.product_id,
+    p.category,
+    c.country;
+
+ALTER TABLE production.fact_sales
+CLUSTER BY (sales_date, product_id);
+
+SHOW TABLES LIKE 'FACT_SALES' IN SCHEMA production;
+
+-----DIMENSION TABLE
+CREATE OR REPLACE TABLE production.dim_customers AS
+SELECT
+    c.customer_id,
+    c.name,
+    c.email,
+    c.country,
+    c.created_at,
+    COUNT(DISTINCT t.transaction_id) AS lifetime_transactions,
+    SUM(t.transaction_total) AS lifetime_value,
+    MAX(t.transaction_date) AS last_purchase_date
+FROM staging.customers c
+LEFT JOIN staging.transactions t
+ON c.customer_id = t.customer_id
+GROUP BY
+    c.customer_id,
+    c.name,
+    c.email,
+    c.country,
+    c.created_at;
+
+----ANALYTICS VIEWS
+CREATE OR REPLACE VIEW production.vw_daily_sales AS
+SELECT
+    sales_date,
+    SUM(total_sales) AS daily_total,
+    COUNT(DISTINCT customer_id) AS unique_customers,
+    SUM(quantity_sold) AS units_sold,
+    ROUND(SUM(total_sales) / NULLIF(COUNT(DISTINCT customer_id),0),2) AS avg_order_value
+FROM production.fact_sales
+GROUP BY sales_date;
+
+
+-----Top Products
+CREATE OR REPLACE VIEW production.vw_top_products AS
+SELECT
+    product_id,
+    category,
+    SUM(quantity_sold) AS total_quantity,
+    SUM(total_sales) AS total_sales
+FROM production.fact_sales
+GROUP BY product_id, category
+ORDER BY total_sales DESC;
+
+
+-----Customer Segmentation
+CREATE OR REPLACE VIEW production.vw_customer_segments AS
+SELECT
+    CASE
+        WHEN lifetime_value >= 10000 THEN 'VIP'
+        WHEN lifetime_value >= 5000 THEN 'Gold'
+        WHEN lifetime_value >= 1000 THEN 'Silver'
+        ELSE 'Bronze'
+    END AS segment,
+    COUNT(*) AS customer_count,
+    SUM(lifetime_value) AS segment_total_value
+FROM production.dim_customers
+GROUP BY segment;
+
+----Add More Customers
+INSERT INTO staging.customers
+(customer_id, name, email, country, created_at, loaded_at)
+VALUES
+(104, 'Priya Mehta', 'priya.mehta@gmail.com', 'India', '2024-04-01', CURRENT_TIMESTAMP()),
+(105, 'Amit Kapoor', 'amit.kapoor@gmail.com', 'India', '2024-04-10', CURRENT_TIMESTAMP()),
+(106, 'Emma Watson', 'emma.watson@gmail.com', 'UK', '2024-05-05', CURRENT_TIMESTAMP());
+SELECT * FROM staging.customers;
+
+
+---Add More Products
+INSERT INTO staging.products
+(product_id, product_name, category, unit_price, supplier_id, loaded_at)
+VALUES
+(204, 'Tablet', 'Electronics', 25000, 304, CURRENT_TIMESTAMP()),
+(205, 'Desk', 'Furniture', 12000, 305, CURRENT_TIMESTAMP());
+
+
+-----Add More Transactions
+INSERT INTO staging.transactions
+(transaction_id, customer_id, product_id, quantity, unit_price, transaction_total, transaction_date, loaded_at)
+VALUES
+(1004, 103, 201, 1, 60000, 60000, '2024-06-04', CURRENT_TIMESTAMP()),
+(1005, 104, 202, 1, 30000, 30000, '2024-06-04', CURRENT_TIMESTAMP()),
+(1006, 105, 203, 4, 7000, 28000, '2024-06-05', CURRENT_TIMESTAMP()),
+(1007, 106, 204, 2, 25000, 50000, '2024-06-05', CURRENT_TIMESTAMP()),
+(1008, 101, 205, 1, 12000, 12000, '2024-06-06', CURRENT_TIMESTAMP()),
+(1009, 102, 201, 1, 60000, 60000, '2024-06-06', CURRENT_TIMESTAMP());
+
+
+
+----Daily Sales Trend
+SELECT * FROM production.vw_daily_sales
+ORDER BY sales_date;
+
+-----Top Products by Revenue
+SELECT * FROM production.vw_top_products;
+
+-----Customer Segmentation
+SELECT * FROM production.vw_customer_segments;
+
+
+
+
+
+
+
